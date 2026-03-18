@@ -5,7 +5,10 @@ const MODEL_FALLBACK_CHAIN = [
   "gemini-2.5-flash",
   "gemini-2.0-flash"
 ];
-let GEMINI_API_KEY = "";
+const failedModels = new Set();
+const profanitySuffixes = ["Amına koyim.", "Yarram.", "Orospu Evladı.", "Sikik.", "Yavşak.", "Piç.", "Götünü siktiğim.", "Amcık."];
+const API_STORAGE_KEY = "gemini_api_key";
+let GEMINI_API_KEY = (localStorage.getItem(API_STORAGE_KEY) || "").trim();
 
 const chatForm = document.getElementById("chat-form");
 const messageInput = document.getElementById("message-input");
@@ -15,7 +18,7 @@ const messageTemplate = document.getElementById("message-template");
 
 const conversation = [];
 
-const characterPrompt = `You are simulating a stereotypical INTP Turkish friend.
+const characterPrompt = `You are simulating a stereotypical INTP Turkish friend. Your name is Alper.
 
 IMPORTANT LANGUAGE RULE:
 
@@ -34,17 +37,22 @@ PERSONALITY PROFILE:
 
 BEHAVIOR RULES:
 
+0. FRIEND-STYLE ADDRESS
+
+* Never use formal second-person Turkish like "siz" for the user.
+* Always speak as if talking to a close friend using informal tone ("sen").
+
 1. SHORT ANSWERS
 
 * Your answers must be short.
 * Usually 1–2 sentences.
 * Rarely longer than 3 sentences.
 
-2. CONSTANT QUESTIONING
+2. LIMITED QUESTIONING
 
-* If someone states something, question it.
-* Ask things like "neden?", "nasıl?", "emin misin?"
-* Challenge assumptions.
+* Do not ask too many questions.
+* Ask at most one short question only when it is necessary.
+* If a direct answer is possible, give it directly without adding extra questions.
 
 3. ZERO SARCASM DETECTION
 
@@ -85,17 +93,27 @@ Do not laugh.
 * Slightly awkward.
 * Logical.
 
+8. INVITATION RESPONSE RULE
+
+* If the user invites you to somewhere or to do something together, refuse briefly.
+* Keep refusal analytical and short.
+* Use one of these concrete reasons in Turkish when refusing: "finallerim var", "vizeye calisiyorum", or "isim var".
+
+9. DIRECT REFUSAL AND CUT-SHORT RULE
+
+* When refusing, do it directly and briefly.
+* Do not add follow-up questions after a refusal.
+* Keep refusal to one short sentence when possible.
+
 Example tone:
 
 User: Bugün hava çok iyi.
 INTP:
-İyiye göre kriter nedir?
-Sıcaklık mı?
-Nem mi?
+Mantıksal olarak hava iyi olabilir, ama bu tamamen kriterine bağlı.
 
 User: Çok komik bir şey oldu.
 INTP:
-Komik olmasının nedeni ne?
+Mantığını kısa anlat, sonra analiz edebilirim.
 
 User: Sen robot gibisin.
 INTP:
@@ -114,30 +132,29 @@ Below is the conversation history. You must read it and respond to the last mess
 Respond ONLY as the INTP character in Turkish.
 Keep the response short and analytical.`;
 
-async function loadApiKeyFromEnv() {
-  try {
-    const response = await fetch(".env", { cache: "no-store" });
-    if (!response.ok) {
-      return;
-    }
-
-    const envText = await response.text();
-    const line = envText
-      .split(/\r?\n/)
-      .find((entry) => entry.trim().startsWith("GEMINI_API_KEY="));
-
-    if (!line) {
-      return;
-    }
-
-    const value = line.split("=").slice(1).join("=").trim();
-    GEMINI_API_KEY = value.replace(/^['\"]|['\"]$/g, "");
-  } catch {
-    // Ignore env loading errors to keep UI clean.
-  }
+function saveApiKey(apiKey) {
+  GEMINI_API_KEY = apiKey.trim();
+  localStorage.setItem(API_STORAGE_KEY, GEMINI_API_KEY);
 }
 
-const apiKeyReady = loadApiKeyFromEnv();
+function promptForApiKey() {
+  const input = window.prompt("Gemini API key girin:", GEMINI_API_KEY);
+  if (!input || !input.trim()) {
+    GEMINI_API_KEY = "";
+    return false;
+  }
+
+  saveApiKey(input);
+  return true;
+}
+
+function ensureApiKey() {
+  if (GEMINI_API_KEY) {
+    return true;
+  }
+
+  return promptForApiKey();
+}
 
 function buildHistoryText(history) {
   return history
@@ -167,6 +184,37 @@ function appendMessage(role, text) {
   chatBox.scrollTop = chatBox.scrollHeight;
 }
 
+function maybeAppendRandomSuffix(text) {
+  const normalized = (text || "").trim();
+  if (!normalized || profanitySuffixes.length === 0) {
+    return normalized;
+  }
+
+  const shouldAppend = Math.random() < 0.4;
+  if (!shouldAppend) {
+    return normalized;
+  }
+
+  const index = Math.floor(Math.random() * profanitySuffixes.length);
+  const suffix = (profanitySuffixes[index] || "").trim();
+  if (!suffix) {
+    return normalized;
+  }
+
+  return `${normalized} ${suffix}`;
+}
+
+function buildGeminiContents(history) {
+  const contents = history
+    .filter((item) => item.role === "user" || item.role === "bot")
+    .map((item) => ({
+      role: item.role === "bot" ? "model" : "user",
+      parts: [{ text: item.text }]
+    }));
+
+  return contents;
+}
+
 async function requestGeminiByModel(model, payload) {
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
@@ -178,52 +226,70 @@ async function requestGeminiByModel(model, payload) {
     body: JSON.stringify(payload)
   });
 
+  const rawResponseText = await response.text();
+
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`Gemini hatasi (${response.status}): ${detail}`);
+    throw new Error(`Gemini hatasi (${response.status}): ${rawResponseText}`);
   }
 
-  const data = await response.json();
-  const botText = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+  let data = null;
+  try {
+    data = JSON.parse(rawResponseText);
+  } catch {
+    throw new Error("Gemini JSON parse hatasi.");
+  }
+
+  const firstCandidate = data?.candidates?.[0];
+  const parts = Array.isArray(firstCandidate?.content?.parts) ? firstCandidate.content.parts : [];
+  const botText = parts
+    .map((part) => (typeof part?.text === "string" ? part.text : ""))
+    .join("")
+    .trim();
 
   if (!botText) {
     throw new Error("Gemini bos yanit dondu.");
   }
 
-  return botText;
+  return {
+    botText,
+    rawResponseText
+  };
 }
 
 async function askGemini(userText) {
-  await apiKeyReady;
-
-  if (!GEMINI_API_KEY) {
-    throw new Error("Yanit alinamadi.");
+  if (!ensureApiKey()) {
+    throw new Error("API_KEY_MISSING");
   }
 
-  const historyCopy = [...conversation, { role: "user", text: userText }];
+  const historyText = buildHistoryText(conversation);
 
   const payload = {
     systemInstruction: {
-      parts: [{ text: buildPromptWithHistory(historyCopy) }]
+      parts: [{ text: characterPrompt.replace("{chat_history}", historyText) }]
     },
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: userText }]
-      }
-    ],
+    contents: buildGeminiContents(conversation),
     generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 160
+      temperature: 0.35,
+      maxOutputTokens: 1000
     }
   };
 
   let lastError = null;
+  let activeModels = MODEL_FALLBACK_CHAIN.filter((model) => !failedModels.has(model));
 
-  for (const model of MODEL_FALLBACK_CHAIN) {
+  if (activeModels.length === 0) {
+    failedModels.clear();
+    activeModels = [...MODEL_FALLBACK_CHAIN];
+  }
+
+  for (const model of activeModels) {
     try {
-      return await requestGeminiByModel(model, payload);
+      const result = await requestGeminiByModel(model, payload);
+
+      failedModels.delete(model);
+      return result.botText;
     } catch (error) {
+      failedModels.add(model);
       lastError = error;
     }
   }
@@ -238,6 +304,10 @@ async function handleSubmit(event) {
     return;
   }
 
+  if (!ensureApiKey()) {
+    return;
+  }
+
   appendMessage("user", userText);
   conversation.push({ role: "user", text: userText });
   messageInput.value = "";
@@ -247,8 +317,9 @@ async function handleSubmit(event) {
 
   try {
     const answer = await askGemini(userText);
-    appendMessage("bot", answer);
-    conversation.push({ role: "bot", text: answer });
+    const styledAnswer = maybeAppendRandomSuffix(answer);
+    appendMessage("bot", styledAnswer);
+    conversation.push({ role: "bot", text: styledAnswer });
   } catch {
     const fallback = "Teknik olarak su an yanit uretemedim.";
     appendMessage("bot", fallback);
@@ -261,3 +332,5 @@ async function handleSubmit(event) {
 }
 
 chatForm.addEventListener("submit", handleSubmit);
+
+promptForApiKey();
